@@ -9,7 +9,7 @@ description: Kiến trúc backend chuẩn cho web bán hàng (client + trang qu�
 >
 > **Nguồn kiến trúc**: chưng cất từ bộ rulebook `MySkills/server/` (implement.md, architecture/*, db/*, security/*, shared/*, tests/*, transaction/*) và cụ thể hoá sang stack NestJS + PostgreSQL.
 >
-> **Trạng thái**: chức năng nghiệp vụ chưa chốt — file này chỉ định nghĩa **khung xương** và **quy ước**. Domain model ở §18 là bản nháp tham chiếu, sẽ chốt sau.
+> **Trạng thái**: chức năng nghiệp vụ chưa chốt — file này chỉ định nghĩa **khung xương** và **quy ước**. Domain model ở §19 là bản nháp tham chiếu, sẽ chốt sau.
 >
 > Cập nhật: 2026-08-04
 
@@ -52,6 +52,7 @@ Ba điều này quyết định 90% chất lượng dự án. Vi phạm = lỗi,
 | **Redis 7** | Bốn việc, tách theo namespace key: (a) **cache** danh mục, sản phẩm hot, cấu hình trang chủ — giảm tải Postgres; (b) **distributed lock** chống trừ kho trùng khi flash sale (nhiều instance API cùng chạy); (c) **lưu refresh token + blacklist** để revoke được token khi user đổi mật khẩu / admin khoá tài khoản; (d) **đếm rate-limit** cho login/OTP/thanh toán. |
 | **BullMQ** (`@nestjs/bullmq`) | **Message queue / job nền**, chạy trên Redis. Đẩy ra khỏi luồng HTTP mọi việc chậm hoặc được phép trễ: gửi mail xác nhận đơn, gửi OTP, resize + tạo thumbnail ảnh sản phẩm, đồng bộ index tìm kiếm, xuất báo cáo Excel cho admin, retry webhook thanh toán thất bại, dọn giỏ hàng bỏ quên, huỷ đơn quá hạn thanh toán. Có sẵn: retry + exponential backoff, delayed job, repeatable job (thay cron), DLQ (failed queue). |
 | **Bull Board** | Dashboard xem/queue/retry job cho admin. Gắn vào route nội bộ, **chặn bằng guard admin** — không để lộ công khai. |
+| **Socket.IO** (`@nestjs/websockets` + `@socket.io/redis-adapter`) | **Thông báo realtime**: admin nghe báo khi có đơn mới (không phải F5), khách thấy trạng thái đơn đổi ngay, cảnh báo sắp hết hàng. **Redis adapter là bắt buộc** — chạy nhiều instance API mà thiếu nó thì sự kiện bắn ở instance này khách nối vào instance kia sẽ không nhận được. Chi tiết §16. |
 | **Elasticsearch 8** | **Tìm kiếm sản phẩm** full-text. Dùng: analyzer tiếng Việt (`icu_folding` bỏ dấu → "dien thoai" ra "Điện thoại"), `fuzziness: AUTO` cho gõ sai, `completion suggester` cho autocomplete, **aggregation** cho bộ lọc facet (đếm số sản phẩm theo brand/khoảng giá/thuộc tính — thứ Postgres làm được nhưng chậm), `function_score` để đẩy sản phẩm bán chạy lên đầu. **Không phải nguồn sự thật** — chi tiết §14. |
 | **Claude API** (`@anthropic-ai/sdk`) | **Chatbot AI tư vấn bán hàng**. Model `claude-opus-5`. Backend làm: giữ khoá API (không bao giờ lộ ra frontend), quản lý lịch sử hội thoại, **stream** câu trả lời qua SSE, và **tool use** — cho AI gọi hàm `search_products` / `get_order_status` / `check_stock` để trả lời bằng dữ liệu thật trong Postgres thay vì bịa. Có **prompt caching** để không trả tiền lại cho system prompt ở mỗi lượt chat. Chi tiết §15. |
 | **VNPay / MoMo** | **Cổng thanh toán**. Backend: tạo URL/deeplink thanh toán có ký `HMAC-SHA512` (VNPay) / `HMAC-SHA256` (MoMo), nhận **IPN webhook** để xác nhận đã trả tiền, verify chữ ký, chống replay, và ghi nhận **idempotent** (webhook có thể bắn nhiều lần cho cùng 1 giao dịch). |
@@ -71,13 +72,41 @@ Ba điều này quyết định 90% chất lượng dự án. Vi phạm = lỗi,
 | **pino** (`nestjs-pino`) | Log JSON có cấu trúc, mỗi dòng gắn `request_id`. **Cấm log**: password, token, chữ ký webhook, số thẻ, PII đầy đủ. |
 | **Jest + Supertest + Testcontainers** | Unit test (mock repo) + integration test (Postgres thật qua Testcontainers) + concurrency test (trừ kho song song). |
 
+### 1.3b Tài khoản & chống lạm dụng (đã chốt)
+
+| Công nghệ | **Dùng để làm gì** |
+|---|---|
+| **Google OAuth2** (`passport-google-oauth20`) | **Đăng nhập bằng Google**. Backend nhận `id_token`, verify với Google, tìm user theo email → có thì đăng nhập, chưa có thì tạo mới với `email_verified_at` sẵn. **Bẫy**: user đã đăng ký bằng mật khẩu rồi sau đó bấm Google cùng email → phải **gộp vào tài khoản cũ**, không tạo tài khoản thứ hai. Bảng `user_identities (user_id, provider, provider_uid)` để một user gắn nhiều cách đăng nhập. |
+| **SMS / OTP** (eSMS hoặc Zalo ZNS) | **Xác thực số điện thoại** lúc đăng ký/đặt hàng và **báo trạng thái giao hàng**. Người mua Việt đọc SMS nhiều hơn email. Bắt buộc kèm: OTP 6 số, **hạn 5 phút**, lưu **hash** OTP trong Redis (không lưu thô), tối đa **5 lần nhập sai** rồi khoá, rate-limit **1 tin/60 giây** và **5 tin/ngày mỗi số** — thiếu chặn này là bị quay số đốt hết tiền SMS. Gửi **qua BullMQ**. |
+| **reCAPTCHA v3** | Chống bot **đăng ký hàng loạt** và **spam đánh giá sản phẩm**. Backend verify token với Google, lấy `score` (0–1) và chặn dưới ngưỡng (0.5). Gắn ở: đăng ký, quên mật khẩu, gửi đánh giá. |
+
+### 1.3c Vận hành (đã chốt)
+
+| Công nghệ | **Dùng để làm gì** |
+|---|---|
+| **@nestjs/terminus** | Endpoint `/health` kiểm tra **thật** Postgres + Redis + Elasticsearch còn sống không, không phải chỉ trả `{ok:true}`. Docker `healthcheck` và load balancer dựa vào nó để biết khi nào được đẩy traffic vào container. Tách 2 route: `/health/live` (process còn sống) và `/health/ready` (đủ phụ thuộc để nhận request). |
+| **Sentry** (`@sentry/nestjs`) | **Bắt lỗi production**: lỗi 500 tự gửi về kèm stack trace, `request_id`, endpoint, user nào gặp. Không có nó thì phải SSH đọc log mới biết. **Bắt buộc cấu hình `beforeSend` để lọc PII** — mặc định Sentry gửi cả body request, tức là gửi cả mật khẩu và token lên dịch vụ bên thứ ba. |
+
+### 1.3d Thư viện phụ trợ (tôi chốt luôn, không phải quyết định kiến trúc)
+
+| Thư viện | Dùng ở đâu |
+|---|---|
+| `@elastic/elasticsearch` | Client chính thức cho Elasticsearch (§14) |
+| `sharp` | Resize + tạo thumbnail + nén WebP trong queue `media` |
+| `exceljs` | Xuất báo cáo Excel trong queue `report` |
+| `@nestjs/cache-manager` + `cache-manager-ioredis-yet` | Decorator cache cho endpoint đọc nhiều (danh mục, trang chủ) |
+| `@faker-js/faker` | Sinh dữ liệu demo cho seed và test |
+| `nestjs-i18n` | Gom câu thông báo (`message` trong envelope) về một chỗ, sau này thêm tiếng Anh không phải sửa controller |
+
 ### 1.4 Điểm CHƯA chốt — cần bạn quyết
 
-| Vấn đề | Vì sao cần quyết | Mặc định tôi đang giả định |
+| Vấn đề | Trạng thái | Chi tiết |
 |---|---|---|
-| **Lưu ảnh sản phẩm** | Bạn chưa chọn MinIO/S3. Web bán hàng chắc chắn cần lưu ảnh sản phẩm, avatar, file báo cáo. | Tạm dùng **local disk + `ServeStaticModule`** (`/uploads`). **Cảnh báo**: không scale được khi chạy nhiều instance, và mất dữ liệu nếu container bị xoá. Nếu deploy thật → nên bổ sung MinIO (S3-compatible, chạy Docker) và upload bằng presigned URL. |
-| **Gửi email** | Cần cho: xác nhận đơn hàng, reset mật khẩu, OTP. | Tạm `nodemailer` + SMTP (Gmail App Password khi dev). Gửi **qua BullMQ**, không gửi đồng bộ trong request. |
-| **Đơn vị tiền** | VNĐ không có phần lẻ → pattern `_cents` của rulebook không hợp. | Dùng **`BIGINT` đơn vị đồng**, đặt tên `total_amount`, `price_amount` + cột `currency CHAR(3)` mặc định `'VND'`. Chi tiết §17.2. |
+| **Lưu ảnh sản phẩm** | ✅ **Đã chốt: local disk** | `/uploads` + `ServeStaticModule`. **Vẫn phải bọc sau `StorageService` interface** (§18.4) để sau đổi sang MinIO/S3 chỉ thay provider, không sửa code nghiệp vụ. Ba rủi ro phải biết trước: (1) xoá container là **mất sạch ảnh** → mount volume Docker, đừng ghi vào lớp ghi của container; (2) chạy >1 instance thì instance A không thấy ảnh instance B upload → **chỉ chạy 1 instance chừng nào còn local disk**; (3) giới hạn kích thước file và **kiểm tra magic bytes**, không tin `Content-Type` client gửi (đổi đuôi `.php` thành `.jpg` là lỗ hổng kinh điển). |
+| **Gửi email** | ⚠ Chưa chốt nhà cung cấp | Cần cho: xác nhận đơn hàng, reset mật khẩu. Tạm `nodemailer` + SMTP (Gmail App Password khi dev, Mailtrap để test không gửi thật). Gửi **qua BullMQ**, không gửi đồng bộ trong request. Lên production nên đổi sang Resend/SendGrid vì Gmail chặn khi gửi nhiều. |
+| **Phí vận chuyển** | ⚠ Tự tính, **không** dùng API GHN/GHTK | Bạn chưa chọn đơn vị giao hàng, nên phí ship phải có **bảng cấu hình nội bộ**: `shipping_rates(province_code, weight_from, weight_to, fee_amount)` + ngưỡng miễn phí ship. Admin tự nhập và tự cập nhật trạng thái giao hàng bằng tay. Nếu sau này nối GHN/GHTK thì thêm `ShippingProvider` interface, phần còn lại giữ nguyên. |
+| **Đơn vị tiền** | ✅ Đã chốt: VND | **`BIGINT` đơn vị đồng**, đặt tên `total_amount`, `price_amount` + cột `currency CHAR(3)` mặc định `'VND'`. Chi tiết §18.2. |
+| **Kiểu khoá chính** | ✅ Đã chốt: UUID | `UUID` cho mọi bảng nghiệp vụ — chống dò dữ liệu bằng cách đoán ID trên URL. Riêng `orders` có thêm cột `code` dạng `DH20260804-0001` để khách và nhân viên đọc/gọi cho nhau (UUID không ai đọc qua điện thoại được). |
 
 ---
 
@@ -309,7 +338,7 @@ export abstract class BaseEntity {
 | **`timestamptz`, không dùng `timestamp`** | Naive timestamp sẽ sai giờ khi deploy khác múi giờ. |
 | **NOT NULL là mặc định** | Cột nullable phải có lý do viết ra được. |
 | **Boolean đặt tên `is_*` / `has_*`** | `is_active`, `is_featured`. Nếu cần biết *khi nào* → dùng `published_at` thay `is_published`. |
-| **Tiền dùng `BIGINT`** | Không bao giờ `float`/`double`. Xem §17.2. |
+| **Tiền dùng `BIGINT`** | Không bao giờ `float`/`double`. Xem §18.2. |
 | **Tên bảng: số nhiều, snake_case** | `products`, `order_items`. |
 
 ### Index bắt buộc cho mỗi bảng
@@ -569,7 +598,7 @@ ON DELETE CASCADE ở DB                    Service tự cascade trong cùng tra
 
 **Vì sao khắt khe vậy?** Số lượng truy vấn trở nên nhìn thấy được và đếm được. Với eager-load, một `find()` vô hại có thể sinh ra 5 JOIN và bảng tạm hàng trăm nghìn dòng mà không ai biết cho tới lúc production chậm.
 
-**Chi phí phải chấp nhận**: viết thủ công nhiều hơn, và **DB không còn bảo vệ bạn khỏi dữ liệu mồ côi** → xem §17.1.
+**Chi phí phải chấp nhận**: viết thủ công nhiều hơn, và **DB không còn bảo vệ bạn khỏi dữ liệu mồ côi** → xem §18.1.
 
 ---
 
@@ -1600,9 +1629,91 @@ chat_messages   id, conversation_id, role(user|assistant), content,
 
 ---
 
-## § 16. Thanh toán VNPay / MoMo + Webhook
+## § 16. Realtime — Socket.IO + Redis adapter
 
-### 16.1 Luồng
+### 16.1 Dùng để làm gì
+
+Không có realtime thì trang quản trị phải F5 mới biết có đơn mới — với shop đang bán thì đó là mất đơn.
+
+| Sự kiện | Ai nhận | Vì sao cần ngay |
+|---|---|---|
+| `order.created` | tất cả admin/staff đang mở trang | Nghe tiếng báo + badge tăng, xử lý đơn trong vài giây |
+| `order.status_changed` | **đúng khách đặt đơn đó** | Khách đang mở trang "Đơn của tôi" thấy đổi từ "Chờ xác nhận" → "Đang giao" mà không cần F5 |
+| `payment.succeeded` | khách + admin | Khách trả tiền xong quay lại web là thấy đơn đã thanh toán ngay, không phải chờ IPN rồi F5 |
+| `product.low_stock` | admin/staff | Cảnh báo sắp hết hàng khi tồn kho xuống dưới ngưỡng |
+| `chat.message` | đúng người trong hội thoại | Nếu sau này có chat với nhân viên thật (không chỉ AI) |
+
+### 16.2 Vì sao bắt buộc có Redis adapter
+
+Socket.IO mặc định giữ danh sách kết nối **trong RAM của từng process**. Chạy 2 instance API thì: khách kết nối vào instance A, đơn hàng lại được xử lý ở instance B → B bắn sự kiện mà khách không nhận được. Redis adapter cho các instance nói chuyện với nhau qua Redis pub/sub.
+
+```ts
+// main.ts
+const pubClient = createClient({ url: env.REDIS_URL });
+const subClient = pubClient.duplicate();
+await Promise.all([pubClient.connect(), subClient.connect()]);
+app.useWebSocketAdapter(new RedisIoAdapter(app, createAdapter(pubClient, subClient)));
+```
+
+> Redis đã có sẵn cho cache/lock/queue rồi, nên đây là chi phí gần như bằng 0 — nhưng thiếu nó thì hệ thống chạy đúng ở máy dev (1 instance) và sai ở production (nhiều instance). Loại bug khó chịu nhất.
+
+### 16.3 Xác thực và phòng — nơi hay bị hổng nhất
+
+WebSocket **không tự đi qua guard HTTP**. Phải tự verify JWT lúc handshake:
+
+```ts
+@WebSocketGateway({ namespace: '/realtime', cors: { origin: env.CORS_ORIGINS } })
+export class RealtimeGateway implements OnGatewayConnection {
+  async handleConnection(client: Socket) {
+    try {
+      const token = client.handshake.auth?.token;          // ★ KHÔNG lấy từ query string
+      const payload = await this.jwt.verifyAsync(token);
+      client.data.user = { id: payload.sub, role: payload.role };
+
+      // Vào phòng theo danh tính — server quyết định, không phải client
+      client.join(`user:${payload.sub}`);
+      if (['admin', 'staff'].includes(payload.role)) client.join('staff');
+    } catch {
+      client.disconnect(true);                              // token sai → cắt ngay
+    }
+  }
+}
+```
+
+**Ba luật cứng:**
+
+1. **Token đi qua `handshake.auth`, không qua query string.** Query string bị ghi vào access log của nginx và mọi proxy trên đường.
+2. **Client không được tự chọn phòng.** Nếu để client gửi `socket.join(room)` thì bất kỳ ai cũng nghe được sự kiện của người khác — chỉ cần đoán `user:<uuid>`. Server gán phòng dựa trên JWT đã verify.
+3. **Realtime chỉ để thông báo, không phải để ghi dữ liệu.** Mọi thao tác thay đổi dữ liệu vẫn đi qua REST có guard + transaction. WebSocket chỉ đẩy tin đi.
+
+### 16.4 Phát sự kiện từ đâu
+
+Giống job queue: **phát sau khi commit**, không phát trong transaction — nếu không, khách nhận thông báo "đơn đã tạo" rồi transaction rollback.
+
+```ts
+const order = await this.tx.run((m) => this.orderService.create(dto, user.id, m));
+// ↑ commit xong ở đây
+this.realtime.toStaff('order.created', { orderId: order.id, code: order.code });
+this.realtime.toUser(user.id, 'order.status_changed', { orderId: order.id, status: order.status });
+```
+
+Worker (process riêng) cũng cần bắn sự kiện — ví dụ webhook thanh toán được xử lý trong worker. Worker không giữ kết nối socket nào, nên nó **publish qua Redis** và instance API đang giữ kết nối sẽ đẩy tới client. Đây chính là lý do thứ hai phải có Redis adapter.
+
+### 16.5 Payload chỉ chứa ID và trạng thái
+
+```ts
+// ❌ Nhét cả đơn hàng vào sự kiện — lộ dữ liệu nếu bắn nhầm phòng, và ôi thiu ngay
+socket.emit('order.created', { ...fullOrderWithCustomerPhone });
+
+// ✅ Chỉ báo "có gì đó đổi", client tự gọi API lấy dữ liệu (đã qua guard)
+socket.emit('order.created', { orderId, code, totalAmount });
+```
+
+---
+
+## § 17. Thanh toán VNPay / MoMo + Webhook
+
+### 17.1 Luồng
 
 ```
 1. Khách bấm "Thanh toán"
@@ -1621,7 +1732,7 @@ chat_messages   id, conversation_id, role(user|assistant), content,
 
 > **6a vs 6b là điểm sai kinh điển.** Return URL do trình duyệt khách gọi → khách sửa được tham số. Chỉ IPN (server-to-server, có chữ ký) mới đáng tin.
 
-### 16.2 Bốn lớp bảo vệ webhook
+### 17.2 Bốn lớp bảo vệ webhook
 
 | # | Lớp | Cách làm |
 |---|---|---|
@@ -1630,7 +1741,7 @@ chat_messages   id, conversation_id, role(user|assistant), content,
 | 3 | **Idempotency** | `transaction_id` của cổng là UNIQUE trong bảng `payment_transactions`. Đã có → trả 200 ngay, không xử lý lại. |
 | 4 | **Đối soát số tiền** | So `amount` từ webhook với `order.totalAmount`. Lệch → **không** cập nhật, ghi cảnh báo, báo admin. |
 
-### 16.3 ⚠ Raw body cho webhook
+### 17.3 ⚠ Raw body cho webhook
 
 Chữ ký được tính trên **byte gốc**. Nếu `express.json()` đã parse và JSON.stringify lại, thứ tự khoá và khoảng trắng có thể đổi → chữ ký luôn sai. Phải giữ raw body **chỉ cho** route webhook:
 
@@ -1638,17 +1749,17 @@ Chữ ký được tính trên **byte gốc**. Nếu `express.json()` đã parse
 app.use('/api/v1/webhooks', express.raw({ type: 'application/json' }));
 ```
 
-### 16.4 Webhook luôn trả 200 nhanh
+### 17.4 Webhook luôn trả 200 nhanh
 
 Nhận → verify → lưu event → **trả 200 ngay** → xử lý nghiệp vụ trong BullMQ. Xử lý đồng bộ mà chậm → cổng thanh toán timeout → nó retry → dễ xử lý trùng.
 
 ---
 
-## § 17. Những điểm cần xử — rủi ro & cách xử lý
+## § 18. Những điểm cần xử — rủi ro & cách xử lý
 
 Đây là phần "xem có xử gì không" bạn yêu cầu. Mỗi mục là một rủi ro có thật của kiến trúc này, kèm cách xử.
 
-### 17.1 ⚠ Không có foreign key → dữ liệu mồ côi
+### 18.1 ⚠ Không có foreign key → dữ liệu mồ côi
 
 **Rủi ro**: DB không còn ngăn `order_items.product_id` trỏ tới sản phẩm không tồn tại. Một bug ở Service là đủ sinh dữ liệu rác vĩnh viễn, và không có gì báo cho bạn biết.
 
@@ -1658,7 +1769,7 @@ Nhận → verify → lưu event → **trả 200 ngay** → xử lý nghiệp v�
 3. **Chính sách cascade viết thành comment ngay trên method** của Service: `// cascade: xoá mềm Order → xoá mềm OrderItem trong cùng transaction`.
 4. **Job kiểm tra toàn vẹn định kỳ** (BullMQ repeatable, chạy hằng đêm): quét các bảng con tìm `*_id` không có bản ghi cha, ghi log + báo admin. Đây là thứ thay thế cho FK.
 
-### 17.2 ⚠ Tiền VNĐ — đổi quy ước `_cents`
+### 18.2 ⚠ Tiền VNĐ — đổi quy ước `_cents`
 
 **Vấn đề**: rulebook gốc quy định `price_cents` (đơn vị nhỏ nhất, USD có 2 chữ số thập phân). VNĐ **không có đơn vị nhỏ hơn đồng** → `price_cents = 50000` gây hiểu nhầm là 500đ.
 
@@ -1672,7 +1783,7 @@ currency       CHAR(3) NOT NULL DEFAULT 'VND'
 - **Cấm tuyệt đối `float`/`double`/`real`** cho tiền. `0.1 + 0.2 !== 0.3` — lệch tiền là lỗi không thể chấp nhận.
 - Định dạng hiển thị ("1.500.000 ₫") làm ở **frontend**, không ở Service.
 
-### 17.3 ⚠ Trừ kho — chỗ dễ sai nhất của web bán hàng
+### 18.3 ⚠ Trừ kho — chỗ dễ sai nhất của web bán hàng
 
 **Rủi ro**: 2 khách mua cùng lúc sản phẩm còn 1 cái → cả hai đọc `stock = 1`, cả hai cùng ghi `stock = 0` → bán 2 cái mà chỉ có 1. Flash sale làm lỗi này xuất hiện chắc chắn.
 
@@ -1698,27 +1809,35 @@ Với flash sale nhiều instance API → thêm **Redis distributed lock** theo 
 
 **Bắt buộc có test đồng thời** (`tests/concurrency`): 100 request song song mua 1 sản phẩm còn 10 → đúng 10 request thành công, 90 request nhận 409.
 
-### 17.4 ⚠ Không có object storage đã chốt
+### 18.4 ⚠ Chọn local disk → ba ràng buộc phải chấp nhận
 
-**Rủi ro**: lưu ảnh sản phẩm vào disk container → chạy nhiều instance thì instance A không thấy ảnh instance B upload; container bị xoá là mất sạch ảnh.
+Đã chốt lưu ảnh vào local disk (§1.4). Đây là lựa chọn hợp lý cho đồ án, nhưng nó **khoá kiến trúc lại ở 1 instance** — cần biết rõ để không ngạc nhiên.
 
-**Cách xử tạm thời**: viết `StorageService` **theo interface** ngay từ đầu:
+| Ràng buộc | Vì sao | Cách xử |
+|---|---|---|
+| **Chỉ chạy được 1 instance API** | Instance A không thấy ảnh instance B vừa upload | Chừng nào còn local disk thì đừng scale ngang. Muốn scale → đổi sang MinIO/S3. |
+| **Xoá container = mất sạch ảnh** | Ghi vào lớp ghi của container là ghi vào thứ bị vứt đi | Mount volume: `- ./uploads:/app/uploads` trong `docker-compose.yml`. **Có backup volume này cùng lịch backup DB** — mất ảnh sản phẩm cũng nghiêm trọng như mất dữ liệu. |
+| **File upload là đường tấn công** | Đổi đuôi `.php`/`.html` thành `.jpg` rồi truy cập trực tiếp | Kiểm **magic bytes** (dùng `file-type`), không tin `Content-Type` client gửi. Đặt tên file lại bằng UUID, không giữ tên gốc. Serve từ đường dẫn riêng, tắt thực thi script ở thư mục đó. |
+
+**Bắt buộc bọc sau interface ngay từ đầu** để sau đổi sang S3 không phải sửa code nghiệp vụ:
+
 ```ts
 export interface StorageService {
-  upload(file: Buffer, key: string): Promise<string>;
+  upload(file: Buffer, key: string, mime: string): Promise<string>;
   delete(key: string): Promise<void>;
-  getPresignedUploadUrl(key: string): Promise<string>;
+  getPresignedUploadUrl?(key: string): Promise<string>;   // local không có → optional
 }
 ```
+
 Hôm nay cài `LocalStorageService`. Khi cần deploy thật, thêm `S3StorageService` và đổi provider trong module — **không sửa một dòng Service nghiệp vụ nào**. Đây là lý do phải bọc dịch vụ ngoài sau interface (§3, thư mục `infrastructure/`).
 
-### 17.5 ⚠ `getMultiFull` bị lạm dụng
+### 18.5 ⚠ `getMultiFull` bị lạm dụng
 
 **Rủi ro**: FE tiện tay gọi `/full` cho mọi màn hình. Mỗi lần thêm một loại quan hệ là thêm một truy vấn IN cho toàn bộ danh sách.
 
 **Cách xử**: giới hạn `limit` của endpoint `/full` xuống tối đa 50 (thay vì 100), và ghi rõ trong Swagger: `/full` dành cho màn hình chi tiết và bảng quản trị, danh sách công khai dùng endpoint thường.
 
-### 17.6 ⚠ Migration nguy hiểm
+### 18.6 ⚠ Migration nguy hiểm
 
 **Rủi ro**: `ALTER TABLE ... SET NOT NULL` trên bảng lớn khoá bảng; `DROP COLUMN` mất dữ liệu không hoàn tác được.
 
@@ -1729,13 +1848,13 @@ Hôm nay cài `LocalStorageService`. Khi cần deploy thật, thêm `S3StorageSe
 - Xoá cột → deploy 2 vòng: vòng 1 code ngừng dùng cột, vòng 2 mới drop. Xoá ngay là rollback không được.
 - Đặt tên file có timestamp: `1754300000000-AddStatusToOrders.ts`.
 
-### 17.7 ⚠ Idempotency cho POST tạo đơn
+### 18.7 ⚠ Idempotency cho POST tạo đơn
 
 **Rủi ro**: khách bấm "Đặt hàng" hai lần (hoặc mạng chập chờn khiến client tự retry) → 2 đơn hàng, trừ kho 2 lần.
 
 **Cách xử**: `@RequireIdempotencyKey()` trên `POST /orders` và `POST /payments`. Guard: `SETNX idem:{key}` trên Redis (TTL 24h) → key đã tồn tại thì trả lại **đúng response đã cache**, không xử lý lại. Nếu cùng key nhưng payload khác → `422 idempotency_key_mismatch`.
 
-### 17.8 ⚠ Envelope không được có ngoại lệ
+### 18.8 ⚠ Envelope không được có ngoại lệ
 
 **Rủi ro**: một endpoint (thường là webhook hoặc file download) quên bọc envelope → FE interceptor bóc `result` gặp `undefined` → lỗi khó truy.
 
@@ -1743,13 +1862,18 @@ Hôm nay cài `LocalStorageService`. Khi cần deploy thật, thêm `S3StorageSe
 
 ---
 
-## § 18. Domain model tham khảo (bản nháp — chốt sau)
+## § 19. Domain model tham khảo (bản nháp — chốt sau)
 
 Chưa phải hợp đồng cuối. Để hình dung phạm vi và kiểm tra khung xương có chịu nổi không.
 
 ```
-users                 id, email(uq partial), password, full_name, phone, role, status
+users                 id, email(uq partial), password, full_name, phone, role, status,
+                      email_verified_at, phone_verified_at
+user_identities       id, user_id, provider(local|google), provider_uid,
+                      uq(provider, provider_uid)          -- 1 user gắn nhiều cách đăng nhập
 addresses             id, user_id, receiver_name, phone, province, district, ward, detail, is_default
+shipping_rates        id, province_code, weight_from, weight_to, fee_amount, is_active
+                      -- tự cấu hình vì chưa nối API GHN/GHTK
 categories            id, parent_id, name, slug(uq partial), display_order, is_active
 brands                id, name, slug, logo_url
 products              id, category_id, brand_id, sku(uq partial), name, slug(uq partial),
@@ -1783,7 +1907,7 @@ activity_logs         id, actor_id, action, target_type, target_id, metadata(jso
 
 ---
 
-## § 19. Quy trình thêm một module mới
+## § 20. Quy trình thêm một module mới
 
 ```
 1.  ĐỌC       tối thiểu 2 module đã có (products, categories) — đủ 6 file mỗi module
@@ -1805,7 +1929,7 @@ activity_logs         id, actor_id, action, target_type, target_id, metadata(jso
 
 ---
 
-## § 20. Checklist trước khi mở Pull Request
+## § 21. Checklist trước khi mở Pull Request
 
 ```
 KIẾN TRÚC
@@ -1844,6 +1968,14 @@ QUEUE & DỊCH VỤ NGOÀI
 [ ] Elasticsearch có fallback về Postgres (unaccent + pg_trgm)
 [ ] Chat AI: khoá API chỉ ở backend · rate-limit theo user · cắt lịch sử hội thoại ·
     tool chỉ ĐỌC và gọi qua Service (không tự viết SQL) · xử lý stop_reason refusal
+[ ] Realtime: verify JWT ở handshake (token qua auth, KHÔNG qua query string) ·
+    server tự gán phòng, client không được tự join · emit SAU commit ·
+    payload chỉ ID + trạng thái · đã bật Redis adapter
+[ ] OTP: lưu HASH trong Redis (không lưu thô) · hạn 5 phút · tối đa 5 lần sai ·
+    rate-limit 1 tin/60s và 5 tin/ngày mỗi số
+[ ] Upload ảnh: giới hạn dung lượng · kiểm magic bytes (không tin Content-Type) ·
+    ghi vào volume Docker, không ghi vào lớp ghi của container
+[ ] Sentry đã cấu hình beforeSend lọc PII (mặc định nó gửi cả body có mật khẩu)
 
 BẢO MẬT & CHẤT LƯỢNG
 [ ] Không hardcode secret — tất cả qua env, .env đã gitignore
@@ -1858,24 +1990,24 @@ BẢO MẬT & CHẤT LƯỢNG
 
 ---
 
-## § 21. Lộ trình dựng dự án
+## § 22. Lộ trình dựng dự án
 
 | Giai đoạn | Nội dung | Kết quả kiểm chứng được |
 |---|---|---|
 | **0. Khung** | Nest + TypeORM + Postgres qua Docker · `BaseEntity/BaseRepository/BaseService/BaseCrudController` · `TransactionService` · envelope interceptor + `@ResponseMessage` · exception filter · config + Joi · Swagger | `GET /api/v1/health` trả đúng envelope có `message` |
-| **1. Auth** | users · register/login/refresh/logout · JwtAuthGuard · RolesGuard · Redis token store · rate-limit login | Đăng nhập → gọi được endpoint có guard · refresh xoay vòng đúng |
+| **1. Auth** | users · `user_identities` · register/login/refresh/logout · **đăng nhập Google** · **OTP SMS** · **reCAPTCHA v3** · JwtAuthGuard · RolesGuard · Redis token store · rate-limit login | Đăng nhập → gọi được endpoint có guard · refresh xoay vòng đúng · đăng ký bằng mật khẩu rồi bấm Google cùng email → **gộp vào 1 tài khoản**, không tạo cái thứ hai |
 | **2. Catalog** | categories · brands · products · images · kế thừa `BaseCrudController` · tách controller public/admin | **Module `categories` chỉ tốn ~15 dòng controller + ~60 dòng service mà có đủ 11 route** |
 | **3. Queue** | BullMQ + worker + Bull Board · queue `mail`, `media` · resize ảnh · mail xác thực | Kill worker → job không mất, bật lại chạy tiếp |
 | **4. Tìm kiếm** | Elasticsearch + analyzer tiếng Việt (`icu_folding`) + facet aggregation + queue `search` + `reindex-all` qua alias + fallback Postgres | Gõ "dien thoai" ra "Điện thoại" · tắt Elasticsearch → tìm kiếm vẫn chạy |
 | **5. Giỏ & Đơn** | carts · orders · trừ kho nguyên tử + lock · transaction · idempotency · job huỷ đơn quá hạn | Test đồng thời 100 request / 10 sản phẩm → đúng 10 thành công |
 | **6. Thanh toán** | VNPay/MoMo · raw body webhook · verify chữ ký · chống replay · đối soát tiền · queue `payment` | Bắn lại IPN 5 lần → chỉ ghi nhận 1 lần |
-| **7. Quản trị** | dashboard · báo cáo doanh thu · xuất Excel qua queue (202 + jobId) · activity log · quản lý người dùng | Xuất 50k đơn không chặn API |
+| **7. Realtime + Quản trị** | Socket.IO + Redis adapter · thông báo đơn mới cho staff · dashboard · báo cáo doanh thu · xuất Excel qua queue (202 + jobId) · activity log · quản lý người dùng | Mở 2 tab admin, đặt 1 đơn → **cả 2 tab cùng hiện ngay**, không F5 · xuất 50k đơn không chặn API |
 | **8. Chat AI** | `AiService` (Claude) · SSE stream · tool `search_products`/`get_order_status` · prompt caching · rate-limit + hạn mức token theo user | Hỏi "còn laptop dưới 20 triệu không" → AI tra DB thật, không bịa · `cache_read_input_tokens` > 0 |
-| **9. Hoàn thiện** | reviews · vouchers · notifications · job kiểm tra toàn vẹn dữ liệu · tài liệu deploy | Job đêm phát hiện được bản ghi mồ côi |
+| **9. Hoàn thiện** | reviews · vouchers · notifications · `@nestjs/terminus` (`/health/live` + `/health/ready`) · Sentry (có lọc PII) · job kiểm tra toàn vẹn dữ liệu · tài liệu deploy | Tắt Postgres → `/health/ready` trả 503 · ném lỗi thử → Sentry nhận được, **không kèm mật khẩu trong body** · job đêm phát hiện được bản ghi mồ côi |
 
 ---
 
-## § 22. Bản tóm tắt dán lên tường
+## § 23. Bản tóm tắt dán lên tường
 
 ```
 VÀNG: ĐỌC → TÁI SỬ DỤNG → HỎI NẾU KHÔNG CHẮC → RỒI MỚI VIẾT.
@@ -1902,6 +2034,8 @@ LUẬT CỨNG:
   · Webhook: chữ ký + replay + idempotency + đối soát tiền
   · AI: chỉ ĐỌC, tool gọi qua Service (quyền vẫn kiểm) · khoá API chỉ ở backend ·
     kiểm stop_reason='refusal' TRƯỚC khi đọc content · system prompt cố định để cache
+  · Socket: verify JWT ở handshake · SERVER gán phòng (client không tự join) ·
+    emit SAU commit · phải có Redis adapter nếu chạy >1 instance
 
 ROUTE: GET /res · GET /res/full · GET /res/:id · GET /res/full/:id
        POST /res · PUT /res/:id
@@ -1925,7 +2059,7 @@ CẤM: logic trong controller · CRUD tự viết tay · FK/eager-load · xoá �
 
 ---
 
-## § 23. Tài liệu liên quan
+## § 24. Tài liệu liên quan
 
 | Chủ đề | File gốc trong `MySkills/server/` |
 |---|---|
