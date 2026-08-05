@@ -1,0 +1,19 @@
+# MySkills là git repo riêng (github.com/HaiSonMin/MySkills) — không track ở đây
+MySkills/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Node
+node_modules/
+dist/
+build/
+*.log
+
+# Env — không bao giờ commit secret
+.env
+.env.*
+!.env.example
