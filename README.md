@@ -1,6 +1,6 @@
 # TTTN 2026 - Nhóm 7
 
-Đồ án tốt nghiệp: web bán hàng (client + trang quản trị).
+Đồ án thực cập: web bán hàng (client + trang quản trị).
 
 ## Stack
 

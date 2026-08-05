@@ -1,4 +1,4 @@
 # Backend
 
-Nhánh này phụ trách phần backend.
-Tham khảo kiến trúc tại `.skill/backend/architecture.md` trước khi code.
+Nhánh này phụ trách phần frontend.
+Tham khảo kiến trúc tại `.skill/frontend/architecture.md` trước khi code.
